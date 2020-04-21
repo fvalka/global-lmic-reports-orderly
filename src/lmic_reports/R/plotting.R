@@ -1,10 +1,30 @@
+match_clean <- function(a,b, quiet=TRUE){
+  a <- gsub("[[:punct:][:space:]]","",tolower(stringi::stri_trans_general(a, "latin-ascii")))
+  b <- gsub("[[:punct:][:space:]]","",tolower(stringi::stri_trans_general(b, "latin-ascii")))
+  ret <- match(a,b)
+  if(sum(is.na(ret)>0)){
+    dists <- stringdist::seq_distmatrix(lapply(a,utf8ToInt),lapply(b,utf8ToInt))
+    ret[is.na(ret)] <- apply(dists[which(is.na(ret)),,drop=FALSE],1,which.min)
+    if(!quiet){
+      return(unique(cbind(a,b[ret])))
+    }
+  }
+  return(ret)
+}
+
 
 cumulative_deaths_plot <- function(country) {
   
   d <- readRDS("ecdc_all.rds")
+  d$Region[d$Region=="Congo"] <- "Republic of Congo"
+  d$Region[d$Region=="United_Republic_of_Tanzania"] <- "Tanzania"
   start <- 10
   
-  d$Continent <- countrycode::countrycode(d$Region, origin = 'country.name', destination = 'continent')
+  country <- gsub("[[:punct:]]", "", country)
+  country <- gsub(" ", "_", country)
+  country <- d$Region[match_clean(country, d$Region)]
+  
+  suppressWarnings(d$Continent <- countrycode::countrycode(d$Region, origin = 'country.name', destination = 'continent'))
   d$Continent[d$Region=="Eswatini"] <- "Africa"
   d$Continent[d$Region=="United State of America"] <- "Americas"
   d$Continent[d$Region=="Isle_of_Man"] <- "Europe"             
@@ -27,6 +47,7 @@ cumulative_deaths_plot <- function(country) {
     mutate(Cum_Deaths = cumsum(deaths),
            Cum_Cases = cumsum(cases))
   
+  country <- gsub("_" ," ", country)
   df$Region <- gsub("_" ," ", df$Region)
   
   df_deaths <- df %>% 
@@ -381,62 +402,197 @@ FacetZoom2 <- ggproto(
 )
 
 
-cases_plot <- function(out, data) {
+
+cases_plot <- function(out, data, date = Sys.Date(), date_0) {
   
-  o1 <- squire:::calibrate_output_parsing(
-    out, 
-    date_0 = as.Date(data$date[max(which(data$deaths == max(data$deaths)))])
-  )
-  
-  
-  
-  gg_cases <- squire:::plot_calibration_cases_barplot(o1, data = data, forecast = 0) + 
-    ggplot2::xlim(c(Sys.Date() - 28, Sys.Date()))
+  gg_cases <- squire:::plot_calibration_cases_barplot(out, data = data, forecast = 0) + 
+    ggplot2::xlim(c(date - 28, date))
   
   gg_cases + ggplot2::theme(legend.position = c(0,1), 
                             legend.justification = c(0,1), 
                             legend.direction = "horizontal") + 
     facet_zoom2(ylim = c(0, max(abs(diff(data$cases))*2)), zoom.size = 0.5) +
-    ggtitle("Plot on right zoomed in on reported cases")
+    ggtitle("Plot on right zoomed in on reported cases") +
+    geom_vline(xintercept = date, linetype = "dashed")
   
 }
 
 
-deaths_plot <- function(out, data) {
+
+deaths_plot <- function(out, data,date_0, date = Sys.Date()) {
   
   o1 <- squire:::calibrate_output_parsing(
     out, 
-    date_0 = as.Date(data$date[max(which(data$deaths == max(data$deaths)))])
+    date_0 = date_0
   )
   
   gg_deaths <- squire:::plot_calibration_deaths_barplot(o1, data = data, forecast = 14, cumulative = FALSE) 
   gg_deaths 
+  
+}
+
+
+deaths_plot_contrast <- function(o1, o2, data, date_0, date = Sys.Date(), 
+                                 forecast = 14, cumulative = TRUE) {
+  
+  o1$Scenario <- "No change to epidemic"
+  o2$Scenario <- "Mitigation (50% reduction from today)"
+  df <- rbind(o1,o2)
+  
+  # day
+  df$day <- as.Date(as.character(df$date))
+  
+  # split to correct dates
+  if(!cumulative) {
+    sub <- df[df$compartment == "deaths" &
+                df$date <=  date + forecast + 1,]  %>%
+      dplyr::group_by(.data$day, .data$replicate, .data$Scenario) %>%
+      dplyr::summarise(y = mean(.data$y), n=dplyr::n()) %>%
+      dplyr::filter(.data$day <= date + forecast)
     
-  # geom_label(
-  #   data = data.frame(x = c(as.Date(data$date[max(which(data$deaths == max(data$deaths)))]),Sys.Date()),
-  #                     y = c(max(o1$y[o1$compartment == "deaths" & o1$date < (Sys.Date()+14)])*0.85,
-  #                           max(o1$y[o1$compartment == "deaths" & o1$date < (Sys.Date()+14)])*0.75),
-  #                     label=c("Calibration Date",as.character(Sys.Date()))), 
-  #   aes(x=x, y=y, label=label), inherit.aes = FALSE) +
-  #   ggplot2::theme(legend.position = c(0,1), 
-  #                  legend.justification = c(0,1), 
-  #                  legend.direction = "horizontal") + 
-  #   
-  #   
+    title <- "Daily Deaths"
+    
+    # format deaths
+    data$deaths <- rev(c(tail(data$deaths,1), diff(rev(data$deaths))))
+    
+  } else {
+    sub <- df[df$compartment == "D" &
+                df$date <=  date + forecast + 1,]  %>%
+      dplyr::group_by(.data$day, .data$replicate, .data$Scenario) %>%
+      dplyr::summarise(y = mean(.data$y), n=dplyr::n()) %>%
+      dplyr::filter(.data$day <= date + forecast)
+    
+    title <- "Cumulative Deaths"
+  }
+  
+  pd_group <- dplyr::group_by(sub, .data$day, .data$Scenario) %>%
+    dplyr::summarise(quants = list(quantile(.data$y, c(0.025, 0.25, 0.5, 0.75, 0.975))),
+                     ymin = round(.data$quants[[1]][1]),
+                     ymax = round(.data$quants[[1]][5]),
+                     yinner_min = round(.data$quants[[1]][2]),
+                     yinner_max = round(.data$quants[[1]][4]),
+                     y = median(.data$y),
+                     n = dplyr::n())
+  
+  
+  # Plot
+  gg_healthcare <- ggplot2::ggplot(sub,
+                                   ggplot2::aes(x = .data$day,
+                                                y = .data$y,
+                                                fill = .data$compartment)) +
+    ggplot2::geom_ribbon(data = pd_group,
+                         mapping = ggplot2::aes(ymin = .data$ymin,
+                                                ymax = .data$ymax,
+                                                fill = Scenario),
+                         color = "white",
+                         alpha = 0.2,
+                         size = 0,
+                         show.legend = TRUE) +
+    ggplot2::geom_ribbon(data = pd_group,
+                         mapping = ggplot2::aes(ymin = .data$yinner_min,
+                                                ymax = .data$yinner_max,
+                                                fill = Scenario),
+                         color = "white",
+                         alpha = 0.8,
+                         size = 0,
+                         show.legend = TRUE) +
+    ggplot2::geom_vline(xintercept = date, linetype = "dashed") +
+    ggplot2::theme_bw()  +
+    ggplot2::ylab(title) +
+    ggplot2::scale_y_continuous(expand = c(0,0)) +
+    ggplot2::scale_x_date(date_breaks = "1 week", date_labels = "%b %d",
+                          limits = c(date - 7, date + forecast)) +
+    ggplot2::scale_fill_manual(name = "", labels = rev(c("Maintain Status Quo", "Additional 50% Reduction")),
+                               values = (c("#3f8ea7","#c59e96"))) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, colour = "black"),
+                   axis.title.x = ggplot2::element_blank(),
+                   panel.grid.major.x = ggplot2::element_blank(),
+                   panel.grid.minor.x = ggplot2::element_blank(),
+                   panel.border = ggplot2::element_blank(),
+                   panel.background = ggplot2::element_blank(),
+                   axis.line = ggplot2::element_line(colour = "black"),
+                   legend.position = "top", 
+                   legend.justification = c(0,1), 
+                   legend.direction = "horizontal") 
+  
+  gg_healthcare
   
   
 }
+
 
 
 healthcare_plot <- function(out, data) {
   
   o1 <- squire:::calibrate_output_parsing(
     out, 
-    date_0 = as.Date(data$date[max(which(data$deaths == max(data$deaths)))])
+    date_0 = date_0
   )
   
   cowplot::plot_grid(squire:::plot_calibration_healthcare_barplot(df = o1, data = data, what = "hospital"),
                      squire:::plot_calibration_healthcare_barplot(df = o1, data = data, what = "ICU"),
                      ncol=2)
+  
+}
+
+
+healthcare_plot_contrast <- function(o1, o2, data, date_0, date = Sys.Date(), forecast = 14, what = "ICU_demand") {
+  
+  o1$Scenario <- "No change to epidemic"
+  o2$Scenario <- "Mitigation (50% reduction from today)"
+  df <- rbind(o1,o2)
+  
+  # day
+  df$day <- as.Date(as.character(df$date))
+  
+  # split to correct dates
+  sub <- df[df$compartment %in% what &
+              df$date <=  date + forecast + 1,] %>%
+    dplyr::group_by(.data$day, .data$replicate, .data$Scenario) %>%
+    dplyr::summarise(y = mean(.data$y), n=dplyr::n()) %>%
+    dplyr::filter(.data$day <= Sys.Date() + forecast)
+  
+  pd_group <- dplyr::group_by(sub, .data$day, .data$Scenario) %>%
+    dplyr::summarise(quants = list(quantile(.data$y, c(0.025, 0.5, 0.975))),
+                     ymin = .data$quants[[1]][1],
+                     y = median(.data$y),
+                     ymax = .data$quants[[1]][3])
+  
+  # y axis
+  if (what == "ICU_demand") {
+    title <- "ICU Demand"
+  } else if(what == "hospital_demand") {
+    title <- "Hospital Bed Demand"
+  }
+  
+  # Plot
+  suppressMessages(suppressWarnings(
+  gg_healthcare <- ggplot2::ggplot(sub, ggplot2::aes(x = .data$day,
+                                                     y = .data$y, 
+                                                     fill = .data$Scenario)) +
+    ggplot2::geom_bar(data = pd_group,
+                      mapping = ggplot2::aes(x = .data$day, y = .data$y, fill = .data$Scenario),
+                      stat = "identity",
+                      show.legend = TRUE,
+                      inherit.aes = FALSE) +
+    ggplot2::geom_vline(xintercept = date, linetype = "dashed") +
+    ggplot2::ylab(title) +
+    ggplot2::theme_bw()  +
+    ggplot2::scale_y_continuous(expand = c(0,0)) +
+    ggplot2::scale_fill_manual(name = "", labels = (c("Maintain Status Quo", "Additional 50% Reduction")),
+                               values = rev(c("#3f8ea7","#c59e96"))) +
+    ggplot2::scale_x_date(date_breaks = "1 week", date_labels = "%b %d", limits = c(Sys.Date()-7, Sys.Date() + forecast)) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, colour = "black"),
+                   axis.title.x = ggplot2::element_blank(),
+                   panel.grid.major.x = ggplot2::element_blank(),
+                   panel.grid.minor.x = ggplot2::element_blank(),
+                   legend.position = "top", 
+                   legend.justification = c(0,1),
+                   legend.direction = "horizontal",
+                   panel.border = ggplot2::element_blank(),
+                   panel.background = ggplot2::element_blank(),
+                   axis.line = ggplot2::element_line(colour = "black"))
+  ))
+  gg_healthcare
   
 }
